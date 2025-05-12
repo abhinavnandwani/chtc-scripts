@@ -7,7 +7,7 @@ MODEL_TYPE="mlp" #logistic
 META_PATH="c02x_split_seed42_PAC.pkl"
 PHENOTYPE_COLUMN="c02x"
 
-OUT_DIR="/results"
+OUT_DIR="./results_scFoundation"
 SUMMARY_CSV="${OUT_DIR}/hyperparam_sweep_summary.csv"
 mkdir -p "$OUT_DIR"
 N_VAL_SPLITS=5
