@@ -1,4 +1,5 @@
 import os
+import sys
 
 import torch
 import torch.nn as nn
@@ -7,7 +8,6 @@ from sklearn.model_selection import train_test_split
 
 import pandas as pd
 import pickle
-
 
 class MLP(nn.Module):
     def __init__(self, input_dim, hidden_dims, num_classes):
@@ -45,7 +45,7 @@ def get_model_data_path(model_name):
     elif model_name=="UCE":
         data_path="/media/sayalialatkar/T9/Sayali/FoundationModels/UCE_venv/UCE-main/results/cell_embeddings/extracted_cell_embeddings"
     elif model_name=="scFoundation":
-        data_path="/scFoundation-embeddings-PASCODE"
+        data_path="scFoundation/extracted_cell_embeddings/"
     elif model_name=="Geneformer":
         data_path="/media/sayalialatkar/T9/Sayali/FoundationModels/Geneformer_30M/extracted_cell_embeddings"
     elif model_name=="scMulan":
@@ -62,8 +62,8 @@ def get_metadata(meta_path, sample_column='SubID', phen_column='c15x',val_split=
         data = pickle.load(handle)
 
     # Map phenotype labels
-    data['train'][phen_column] = data['train'][phen_column].map({"AD":1, "Control":0})
-    data['test'][phen_column] = data['test'][phen_column].map({"AD":1, "Control":0})
+    # data['train'][phen_column] = data['train'][phen_column].map({"AD":1, "Control":0})
+    # data['test'][phen_column] = data['test'][phen_column].map({"AD":1, "Control":0})
 
     df = data['train'].copy()
 
@@ -92,7 +92,7 @@ def get_metadata_cv(meta_path, sample_column='SubID', phen_column='c15x'):
 
     df = data['train'].copy()
     # Map phenotype labels
-    df[phen_column] = df[phen_column].map({"AD":1, "Control":0})
+    # df[phen_column] = df[phen_column].map({"AD":1, "Control":0})
     
     sample_ids = df[sample_column].unique().tolist()
     labels = [df.loc[df[sample_column] == sid, phen_column].iloc[0] for sid in sample_ids]
@@ -147,3 +147,66 @@ class EmbDataset(Dataset):
         return data, label, weight
 
 
+
+class DonorDataset(Dataset):
+    """
+    Dataset that returns one averaged embedding per donor.
+    """
+    def __init__(
+        self,
+        file_list,
+        data_path,
+        label_mapping,
+        scaler=None,
+        cache_data=True,
+        file_format="csv"
+    ):
+        self.file_list = file_list
+        self.data_path = data_path
+        self.label_mapping = label_mapping
+        self.scaler = scaler
+        self.cache_data = cache_data
+        self.file_format = file_format
+        self.file_cache = {}
+
+        # uniform dummy weight per donor
+        n = len(file_list)
+        self.weights = [1.0 / n] * n
+
+        # Pre-load and average if caching
+        for donor in file_list:
+            file_path = os.path.join(data_path, donor + f".{file_format}")
+            if file_format == "csv":
+                df = pd.read_csv(file_path, index_col=0)
+            else:
+                df = pd.read_parquet(file_path)
+            avg_vec = df.values.mean(axis=0)
+            if scaler is not None:
+                avg_vec = scaler.transform(avg_vec.reshape(1, -1)).squeeze(0)
+            self.file_cache[donor] = avg_vec.astype('float32')
+            del df
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, idx):
+        donor = self.file_list[idx]
+        # get averaged embedding
+        avg_vec = self.file_cache[donor] if self.cache_data else None
+        if avg_vec is None:
+            # lazy-load if not cached
+            file_path = os.path.join(self.data_path, donor + f".{self.file_format}")
+            if self.file_format == "csv":
+                df = pd.read_csv(file_path, index_col=0)
+            else:
+                df = pd.read_parquet(file_path)
+            avg_vec = df.values.mean(axis=0)
+            if self.scaler is not None:
+                avg_vec = self.scaler.transform(avg_vec.reshape(1, -1)).squeeze(0)
+            avg_vec = avg_vec.astype('float32')
+
+        data = torch.tensor(avg_vec, dtype=torch.float32)
+        label = torch.tensor(int(self.label_mapping.get(donor, -1)), dtype=torch.long)
+        weight = torch.tensor(self.weights[idx], dtype=torch.float32)
+
+        return data, label, weight
