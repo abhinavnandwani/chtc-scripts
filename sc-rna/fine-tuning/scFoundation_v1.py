@@ -1,4 +1,7 @@
 import os
+import sys
+import signal
+import gc
 import pickle
 import numpy as np
 from sklearn.model_selection import train_test_split
@@ -9,19 +12,37 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import argparse
 
-from model.load import load_model_frommmf, gatherData  # scFoundation-specific
+from load import load_model_frommmf, gatherData  # scFoundation-specific
 
 # -------------------------
 # Configuration (EDIT these)
 # -------------------------
-LABEL_PKL_PATH     = "./labels/c02x_labels.pkl"             # Pickle file: donor-level labels for a specific contrast
-PRETRAINED_CKPT    = "./checkpoints/scFoundation_pretrained.pt"  # Path to scFoundation checkpoint
-SAVE_DIR           = "./outputs/finetuned_c02x"             # Where models will be saved
+LABEL_PKL_PATH     = "../../c02x_split_seed42.pkl"             # Pickle file: donor-level labels for a specific contrast
+PRETRAINED_CKPT    = "./models/scFoundation_pretrained.pt"    # Path to scFoundation checkpoint
+SAVE_DIR           = "./models/finetuned_c02x"                # Where models will be saved
 UNFREEZE_LAST_N    = 2         # Number of final transformer layers to unfreeze
 EPOCHS             = 5         # Number of training epochs
 BATCH_SIZE         = 64
 LEARNING_RATE      = 1e-4
 RANDOM_SEED        = 42
+
+# -------------------------
+# Signal Handling for Graceful Exit
+# -------------------------
+model = None  # Global model reference for signal handler
+
+def handle_interrupt(signal_received, frame):
+    print("\n[INFO] Interrupt received. Cleaning up...")
+    if model is not None:
+        partial_ckpt = os.path.join(SAVE_DIR, "finetuned_partial_interrupt.pt")
+        torch.save(model.state_dict(), partial_ckpt)
+        print(f"[INFO] Saved partial checkpoint: {partial_ckpt}")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, handle_interrupt)
 
 # -------------------------
 # Dataset: One sample per cell, pulled from donor-level .npz
@@ -33,7 +54,7 @@ class CSRGeneExpressionDataset(Dataset):
             donor_id = os.path.basename(path).split('.')[0]
             label = label_map.get(donor_id)
             if label is None:
-                continue  # Skip donors not included in the contrast
+                continue
             data = np.load(path)
             matrix = csr_matrix((data['data'], data['indices'], data['indptr']), shape=data['shape'])
             for i in range(matrix.shape[0]):
@@ -60,16 +81,13 @@ class FineTuneClassifier(nn.Module):
         self.pos_emb = self.model.pos_emb
         self.encoder = self.model.encoder
 
-        # Freeze everything
         for param in self.parameters():
             param.requires_grad = False
 
-        # Unfreeze only the last N layers of the encoder (adaptation while avoiding overfitting)
         for layer in self.encoder.transformer_encoder[-unfreeze_last_n:]:
             for param in layer.parameters():
                 param.requires_grad = True
 
-        # Add classification head (output is a single logit)
         self.norm = nn.BatchNorm1d(self.model_config['encoder']['hidden_dim'], affine=False)
         self.classifier = nn.Sequential(
             nn.Linear(self.model_config['encoder']['hidden_dim'], 256),
@@ -89,12 +107,12 @@ class FineTuneClassifier(nn.Module):
         x += self.pos_emb(pos_ids)
 
         x = self.encoder(x, padding_mask)
-        x, _ = torch.max(x, dim=1)  # Global max pooling
+        x, _ = torch.max(x, dim=1)
         x = self.norm(x)
         return self.classifier(x)
 
 # -------------------------
-# Training loop (prints balanced accuracy)
+# Training loop (saves checkpoint every epoch)
 # -------------------------
 def train_model(model, train_loader, test_loader, optimizer, criterion, device, epochs):
     for epoch in range(epochs):
@@ -128,6 +146,11 @@ def train_model(model, train_loader, test_loader, optimizer, criterion, device, 
         val_acc = balanced_accuracy_score(val_truths, val_preds)
         print(f"             Test Balanced Acc: {val_acc:.4f}")
 
+        # Save checkpoint
+        epoch_ckpt = os.path.join(SAVE_DIR, f"finetuned_epoch_{epoch+1}.pt")
+        torch.save(model.state_dict(), epoch_ckpt)
+        print(f"[INFO] Saved checkpoint: {epoch_ckpt}")
+
 # -------------------------
 # Main entry point
 # -------------------------
@@ -142,9 +165,8 @@ def main():
     # Load donor-level contrast labels
     with open(LABEL_PKL_PATH, 'rb') as f:
         label_data = pickle.load(f)
-    label_map = dict(zip(label_data['train']['SubID'], label_data['train']['c02x']))  # Adjust key if needed
+    label_map = dict(zip(label_data['train']['SubID'], label_data['train']['c02x']))
 
-    # Only include donors that are labeled in the current contrast
     all_files = [f for f in os.listdir(args.data_dir) if f.endswith('.npz')]
     donor_paths = [os.path.join(args.data_dir, f) for f in all_files
                    if os.path.splitext(f)[0] in label_map]
@@ -152,7 +174,6 @@ def main():
     if len(donor_paths) == 0:
         raise ValueError("No labeled donor files found in data_dir.")
 
-    # Prepare stratified split
     donor_ids = [os.path.splitext(os.path.basename(p))[0] for p in donor_paths]
     donor_labels = [label_map[did] for did in donor_ids]
 
@@ -163,20 +184,19 @@ def main():
         random_state=RANDOM_SEED
     )
 
-    # Datasets and loaders
     train_ds = CSRGeneExpressionDataset(train_donors, label_map)
     test_ds = CSRGeneExpressionDataset(test_donors, label_map)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=os.cpu_count())
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, num_workers=os.cpu_count())
 
-    # Initialize and train model
+    global model
     model = FineTuneClassifier(PRETRAINED_CKPT, unfreeze_last_n=UNFREEZE_LAST_N).to(device)
     optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=LEARNING_RATE)
     criterion = nn.BCEWithLogitsLoss()
 
     train_model(model, train_loader, test_loader, optimizer, criterion, device, EPOCHS)
 
-    # Save both versions of the model
+    # Save final version
     torch.save(model.state_dict(), os.path.join(SAVE_DIR, "finetuned_classifier.pt"))
     torch.save(model.encoder.state_dict(), os.path.join(SAVE_DIR, "finetuned_encoder.pt"))
     print("Training complete. Models saved.")
