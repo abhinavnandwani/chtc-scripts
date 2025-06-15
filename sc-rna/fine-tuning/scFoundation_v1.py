@@ -15,27 +15,28 @@ import argparse
 from load import load_model_frommmf, gatherData  # scFoundation-specific
 
 # -------------------------
-# Configuration (EDIT these)
+# Configuration
 # -------------------------
-LABEL_PKL_PATH     = "../../c02x_split_seed42.pkl"             # Pickle file: donor-level labels for a specific contrast
-PRETRAINED_CKPT    = "./models/scFoundation_pretrained.pt"    # Path to scFoundation checkpoint
-SAVE_DIR           = "./models/finetuned_c02x"                # Where models will be saved
-UNFREEZE_LAST_N    = 2         # Number of final transformer layers to unfreeze
-EPOCHS             = 5         # Number of training epochs
+LABEL_PKL_PATH     = "../../c02x_split_seed42.pkl"
+PRETRAINED_CKPT    = "./models/scFoundation_pretrained.ckpt"  # now expecting a .ckpt file
+SAVE_DIR           = "./models/finetuned_c02x"
+UNFREEZE_LAST_N    = 2
+EPOCHS             = 5
 BATCH_SIZE         = 64
 LEARNING_RATE      = 1e-4
 RANDOM_SEED        = 42
 
+model = None  # Global model reference for signal handler
+model_config = None  # Save model config for .ckpt serialization
+
 # -------------------------
 # Signal Handling for Graceful Exit
 # -------------------------
-model = None  # Global model reference for signal handler
-
 def handle_interrupt(signal_received, frame):
     print("\n[INFO] Interrupt received. Cleaning up...")
     if model is not None:
-        partial_ckpt = os.path.join(SAVE_DIR, "finetuned_partial_interrupt.pt")
-        torch.save(model.state_dict(), partial_ckpt)
+        partial_ckpt = os.path.join(SAVE_DIR, "finetuned_partial_interrupt.ckpt")
+        torch.save({'model': model.state_dict(), 'config': model_config}, partial_ckpt)
         print(f"[INFO] Saved partial checkpoint: {partial_ckpt}")
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -45,7 +46,7 @@ def handle_interrupt(signal_received, frame):
 signal.signal(signal.SIGINT, handle_interrupt)
 
 # -------------------------
-# Dataset: One sample per cell, pulled from donor-level .npz
+# Dataset Class
 # -------------------------
 class CSRGeneExpressionDataset(Dataset):
     def __init__(self, donor_paths, label_map):
@@ -71,7 +72,7 @@ class CSRGeneExpressionDataset(Dataset):
         return torch.tensor(row, dtype=torch.float32), torch.tensor(label, dtype=torch.float32)
 
 # -------------------------
-# Fine-tuning wrapper with classification head
+# Fine-tuning Model Wrapper
 # -------------------------
 class FineTuneClassifier(nn.Module):
     def __init__(self, ckpt_path, n_classes=1, unfreeze_last_n=2):
@@ -112,7 +113,7 @@ class FineTuneClassifier(nn.Module):
         return self.classifier(x)
 
 # -------------------------
-# Training loop (saves checkpoint every epoch)
+# Training
 # -------------------------
 def train_model(model, train_loader, test_loader, optimizer, criterion, device, epochs):
     for epoch in range(epochs):
@@ -147,12 +148,12 @@ def train_model(model, train_loader, test_loader, optimizer, criterion, device, 
         print(f"             Test Balanced Acc: {val_acc:.4f}")
 
         # Save checkpoint
-        epoch_ckpt = os.path.join(SAVE_DIR, f"finetuned_epoch_{epoch+1}.pt")
-        torch.save(model.state_dict(), epoch_ckpt)
+        epoch_ckpt = os.path.join(SAVE_DIR, f"finetuned_epoch_{epoch+1}.ckpt")
+        torch.save({'model': model.state_dict(), 'config': model_config}, epoch_ckpt)
         print(f"[INFO] Saved checkpoint: {epoch_ckpt}")
 
 # -------------------------
-# Main entry point
+# Main
 # -------------------------
 def main():
     parser = argparse.ArgumentParser()
@@ -162,14 +163,14 @@ def main():
     os.makedirs(SAVE_DIR, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Load donor-level contrast labels
+    # Load label pkl
     with open(LABEL_PKL_PATH, 'rb') as f:
         label_data = pickle.load(f)
     label_map = dict(zip(label_data['train']['SubID'], label_data['train']['c02x']))
 
+    # Donors in current dataset
     all_files = [f for f in os.listdir(args.data_dir) if f.endswith('.npz')]
-    donor_paths = [os.path.join(args.data_dir, f) for f in all_files
-                   if os.path.splitext(f)[0] in label_map]
+    donor_paths = [os.path.join(args.data_dir, f) for f in all_files if os.path.splitext(f)[0] in label_map]
 
     if len(donor_paths) == 0:
         raise ValueError("No labeled donor files found in data_dir.")
@@ -189,21 +190,21 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=os.cpu_count())
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, num_workers=os.cpu_count())
 
-    global model
+    global model, model_config
     model = FineTuneClassifier(PRETRAINED_CKPT, unfreeze_last_n=UNFREEZE_LAST_N).to(device)
+    model_config = model.model_config
     optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=LEARNING_RATE)
     criterion = nn.BCEWithLogitsLoss()
 
     train_model(model, train_loader, test_loader, optimizer, criterion, device, EPOCHS)
 
-    # Save final version
-    torch.save(model.state_dict(), os.path.join(SAVE_DIR, "finetuned_classifier.pt"))
-    torch.save(model.encoder.state_dict(), os.path.join(SAVE_DIR, "finetuned_encoder.pt"))
-    print("Training complete. Models saved.")
+    # Save final versions
+    final_ckpt = os.path.join(SAVE_DIR, "finetuned_final.ckpt")
+    torch.save({'model': model.state_dict(), 'config': model_config}, final_ckpt)
+    print(f"[INFO] Final model saved: {final_ckpt}")
 
 # -------------------------
-# Example usage:
-# python finetune_scfoundation.py --data_dir ./data/donors_subset/
+# Run
 # -------------------------
 if __name__ == '__main__':
     main()
