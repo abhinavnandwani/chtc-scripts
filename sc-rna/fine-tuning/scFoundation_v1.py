@@ -85,29 +85,26 @@ class FineTuneClassifier(nn.Module):
         )
 
     def forward(self, batch):
-        x = batch['x'].unsqueeze(2)
-        B, N, _ = x.shape
-        device = x.device
+        x = batch['x']  # shape: (B, N), where N = number of genes
+        value_mask = x > 0  # Boolean mask for non-zero expression values
 
-        encoder_position_gene_ids = torch.arange(N, device=device).unsqueeze(0).repeat(B, 1)
-        padding_label = torch.zeros(B, N, dtype=torch.bool, device=device)
+        # Generate gene (position) IDs assuming fixed ordering
+        gene_ids = torch.arange(x.size(1), device=x.device).unsqueeze(0).expand_as(x)
 
-        output = self.model(
-            x.squeeze(2),
-            padding_label=padding_label,
-            encoder_position_gene_ids=encoder_position_gene_ids,
-            encoder_labels=torch.ones_like(padding_label),
-            decoder_data=x.squeeze(2),
-            decoder_data_padding_labels=padding_label,
-            decoder_position_gene_ids=encoder_position_gene_ids,
-            mask_gene_name=False,
-            mask_labels=None,
-            output_attentions=False
-        )
+        # Token + positional embeddings
+        x = self.token_emb(x.unsqueeze(-1).float(), output_weight=0)  # shape: (B, N, D)
+        x += self.pos_emb(gene_ids)  # Add learned positional embeddings
 
-        x = torch.max(output, dim=1).values
+        # Encode via transformer
+        x = self.encoder(x, padding_mask=~value_mask)  # (B, N, D)
+
+        # Pool across gene dimension
+        x = torch.max(x, dim=1).values  # shape: (B, D)
+
+        # Normalize and classify
         x = self.norm(x)
         return self.classifier(x)
+
 
 # ===== TRAINING =====
 def train_model(model, train_loader, test_loader, optimizer, criterion, device, epochs):
@@ -152,28 +149,46 @@ def main():
     os.makedirs(SAVE_DIR, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # Load predefined train/test split from pickle
     with open(LABEL_PKL_PATH, 'rb') as f:
         label_data = pickle.load(f)
-    label_map = dict(zip(label_data['train']['SubID'], label_data['train']['c02x']))
 
-    donor_paths = [
+    # Merge train and test labels
+    train_ids = set(label_data['train']['SubID'])
+    test_ids = set(label_data['test']['SubID'])
+    label_map = {
+        **dict(zip(label_data['train']['SubID'], label_data['train']['c02x'])),
+        **dict(zip(label_data['test']['SubID'], label_data['test']['c02x']))
+    }
+
+    # Gather all donor files and their IDs
+    donor_files = [f for f in os.listdir(args.data_path) if f.endswith("_aligned.npz")]
+    donor_ids = [os.path.splitext(f.replace("_aligned", ""))[0] for f in donor_files]
+
+    train_paths = [
         os.path.join(args.data_path, f)
-        for f in os.listdir(args.data_path)
-        if f.endswith("_aligned.npz") and os.path.splitext(f.replace("_aligned", ""))[0] in label_map
+        for f, did in zip(donor_files, donor_ids)
+        if did in train_ids
+    ]
+    test_paths = [
+        os.path.join(args.data_path, f)
+        for f, did in zip(donor_files, donor_ids)
+        if did in test_ids
     ]
 
-    if not donor_paths:
-        raise ValueError("No labeled aligned donor files found.")
+    # ===== HARD CODED TESTING MODE =====
+    train_paths = train_paths[:5]  # first 5 donors for training
+    test_paths = test_paths[:2]    # first 2 donors for testing
+    print(f"[INFO] Using {len(train_paths)} train donors and {len(test_paths)} test donors for testing.")
 
-    donor_ids = [os.path.splitext(os.path.basename(f).replace("_aligned", ""))[0] for f in donor_paths]
-    donor_labels = [label_map[did] for did in donor_ids]
-
-    train_paths, test_paths = train_test_split(
-        donor_paths, test_size=0.2, stratify=donor_labels, random_state=RANDOM_SEED
-    )
+    if not train_paths:
+        raise ValueError("No training donors found.")
+    if not test_paths:
+        raise ValueError("No test donors found.")
 
     train_ds = GeneExpressionDataset(train_paths, label_map)
     test_ds = GeneExpressionDataset(test_paths, label_map)
+
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=os.cpu_count())
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, num_workers=os.cpu_count())
 
@@ -187,6 +202,7 @@ def main():
     torch.save(model.state_dict(), os.path.join(SAVE_DIR, "finetuned_classifier.ckpt"))
     torch.save(model.encoder.state_dict(), os.path.join(SAVE_DIR, "finetuned_encoder.ckpt"))
     print("[INFO] Final model saved.")
+
 
 if __name__ == '__main__':
     main()
