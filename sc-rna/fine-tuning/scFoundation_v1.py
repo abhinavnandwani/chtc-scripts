@@ -6,38 +6,31 @@ import pickle
 import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import balanced_accuracy_score
-from scipy.sparse import csr_matrix
+from scipy.sparse import load_npz
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import argparse
 
-from load import load_model_frommmf, gatherData  # scFoundation-specific
+from load import load_model_frommmf
 
-# -------------------------
-# Configuration
-# -------------------------
+# ===== CONFIG =====
 LABEL_PKL_PATH     = "../../c02x_split_seed42.pkl"
-PRETRAINED_CKPT    = "./models/scFoundation_pretrained.ckpt"  # now expecting a .ckpt file
+PRETRAINED_CKPT    = "./models/scFoundation_pretrained.ckpt"
 SAVE_DIR           = "./models/finetuned_c02x"
 UNFREEZE_LAST_N    = 2
 EPOCHS             = 5
-BATCH_SIZE         = 64
+BATCH_SIZE         = 4
 LEARNING_RATE      = 1e-4
 RANDOM_SEED        = 42
 
-model = None  # Global model reference for signal handler
-model_config = None  # Save model config for .ckpt serialization
+model = None  # For cleanup on interrupt
 
-# -------------------------
-# Signal Handling for Graceful Exit
-# -------------------------
 def handle_interrupt(signal_received, frame):
     print("\n[INFO] Interrupt received. Cleaning up...")
-    if model is not None:
-        partial_ckpt = os.path.join(SAVE_DIR, "finetuned_partial_interrupt.ckpt")
-        torch.save({'model': model.state_dict(), 'config': model_config}, partial_ckpt)
-        print(f"[INFO] Saved partial checkpoint: {partial_ckpt}")
+    if model:
+        torch.save(model.state_dict(), os.path.join(SAVE_DIR, "finetuned_partial_interrupt.ckpt"))
+        print("[INFO] Partial checkpoint saved.")
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     gc.collect()
@@ -45,35 +38,31 @@ def handle_interrupt(signal_received, frame):
 
 signal.signal(signal.SIGINT, handle_interrupt)
 
-# -------------------------
-# Dataset Class
-# -------------------------
-class CSRGeneExpressionDataset(Dataset):
-    def __init__(self, donor_paths, label_map):
+# ===== DATASET =====
+class GeneExpressionDataset(Dataset):
+    def __init__(self, file_paths, label_map):
         self.samples = []
-        for path in donor_paths:
-            donor_id = os.path.basename(path).split('.')[0]
+        self.memory = {}
+
+        for path in file_paths:
+            donor_id = os.path.basename(path).replace("_aligned.npz", "")
             label = label_map.get(donor_id)
             if label is None:
                 continue
-            data = np.load(path)
-            matrix = csr_matrix((data['data'], data['indices'], data['indptr']), shape=data['shape'])
+            matrix = load_npz(path)
+            self.memory[donor_id] = matrix
             for i in range(matrix.shape[0]):
-                self.samples.append((path, i, label))
+                self.samples.append((donor_id, i, label))
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        path, row_idx, label = self.samples[idx]
-        data = np.load(path)
-        matrix = csr_matrix((data['data'], data['indices'], data['indptr']), shape=data['shape'])
-        row = matrix.getrow(row_idx).toarray().squeeze()
+        donor_id, row_idx, label = self.samples[idx]
+        row = self.memory[donor_id].getrow(row_idx).toarray().squeeze()
         return torch.tensor(row, dtype=torch.float32), torch.tensor(label, dtype=torch.float32)
 
-# -------------------------
-# Fine-tuning Model Wrapper
-# -------------------------
+# ===== MODEL =====
 class FineTuneClassifier(nn.Module):
     def __init__(self, ckpt_path, n_classes=1, unfreeze_last_n=2):
         super().__init__()
@@ -84,7 +73,6 @@ class FineTuneClassifier(nn.Module):
 
         for param in self.parameters():
             param.requires_grad = False
-
         for layer in self.encoder.transformer_encoder[-unfreeze_last_n:]:
             for param in layer.parameters():
                 param.requires_grad = True
@@ -97,33 +85,38 @@ class FineTuneClassifier(nn.Module):
         )
 
     def forward(self, batch):
-        x = batch['x']
-        value_labels = x > 0
-        x, padding_mask = gatherData(x, value_labels, self.model_config['pad_token_id'])
+        x = batch['x'].unsqueeze(2)
+        B, N, _ = x.shape
+        device = x.device
 
-        gene_ids = torch.arange(19264, device=x.device).repeat(x.shape[0], 1)
-        pos_ids, _ = gatherData(gene_ids, value_labels, self.model_config['pad_token_id'])
+        encoder_position_gene_ids = torch.arange(N, device=device).unsqueeze(0).repeat(B, 1)
+        padding_label = torch.zeros(B, N, dtype=torch.bool, device=device)
 
-        x = self.token_emb(x.unsqueeze(-1).float(), output_weight=0)
-        x += self.pos_emb(pos_ids)
+        output = self.model(
+            x.squeeze(2),
+            padding_label=padding_label,
+            encoder_position_gene_ids=encoder_position_gene_ids,
+            encoder_labels=torch.ones_like(padding_label),
+            decoder_data=x.squeeze(2),
+            decoder_data_padding_labels=padding_label,
+            decoder_position_gene_ids=encoder_position_gene_ids,
+            mask_gene_name=False,
+            mask_labels=None,
+            output_attentions=False
+        )
 
-        x = self.encoder(x, padding_mask)
-        x, _ = torch.max(x, dim=1)
+        x = torch.max(output, dim=1).values
         x = self.norm(x)
         return self.classifier(x)
 
-# -------------------------
-# Training
-# -------------------------
+# ===== TRAINING =====
 def train_model(model, train_loader, test_loader, optimizer, criterion, device, epochs):
     for epoch in range(epochs):
         model.train()
-        total_loss = 0
-        preds, truths = [], []
-
+        total_loss, preds, truths = 0, [], []
         for x, y in train_loader:
             x, y = x.to(device), y.to(device).unsqueeze(1)
-            logits = model({'x': x, 'targets': y})
+            logits = model({'x': x})
             loss = criterion(logits, y)
             optimizer.zero_grad()
             loss.backward()
@@ -132,79 +125,68 @@ def train_model(model, train_loader, test_loader, optimizer, criterion, device, 
             preds.extend((logits > 0).long().cpu().tolist())
             truths.extend(y.cpu().long().tolist())
 
-        train_acc = balanced_accuracy_score(truths, preds)
-        print(f"[Epoch {epoch+1}] Train Loss: {total_loss / len(train_loader.dataset):.4f} | Train Balanced Acc: {train_acc:.4f}")
+        acc = balanced_accuracy_score(truths, preds)
+        print(f"[Epoch {epoch+1}] Train Loss: {total_loss / len(train_loader.dataset):.4f} | Balanced Acc: {acc:.4f}")
 
-        # Evaluation
         model.eval()
         val_preds, val_truths = [], []
         with torch.no_grad():
             for x, y in test_loader:
                 x, y = x.to(device), y.to(device).unsqueeze(1)
-                logits = model({'x': x, 'targets': y})
+                logits = model({'x': x})
                 val_preds.extend((logits > 0).long().cpu().tolist())
                 val_truths.extend(y.cpu().long().tolist())
         val_acc = balanced_accuracy_score(val_truths, val_preds)
-        print(f"             Test Balanced Acc: {val_acc:.4f}")
+        print(f"             Val Balanced Acc: {val_acc:.4f}")
 
-        # Save checkpoint
-        epoch_ckpt = os.path.join(SAVE_DIR, f"finetuned_epoch_{epoch+1}.ckpt")
-        torch.save({'model': model.state_dict(), 'config': model_config}, epoch_ckpt)
-        print(f"[INFO] Saved checkpoint: {epoch_ckpt}")
+        ckpt_path = os.path.join(SAVE_DIR, f"finetuned_epoch_{epoch+1}.ckpt")
+        torch.save(model.state_dict(), ckpt_path)
+        print(f"[INFO] Saved checkpoint: {ckpt_path}")
 
-# -------------------------
-# Main
-# -------------------------
+# ===== MAIN =====
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', required=True, help='Path to .npz files (1 per donor)')
+    parser.add_argument('--data_path', required=True, help='Path to donor *_aligned.npz files')
     args = parser.parse_args()
 
     os.makedirs(SAVE_DIR, exist_ok=True)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load label pkl
     with open(LABEL_PKL_PATH, 'rb') as f:
         label_data = pickle.load(f)
     label_map = dict(zip(label_data['train']['SubID'], label_data['train']['c02x']))
 
-    # Donors in current dataset
-    all_files = [f for f in os.listdir(args.data_dir) if f.endswith('.npz')]
-    donor_paths = [os.path.join(args.data_dir, f) for f in all_files if os.path.splitext(f)[0] in label_map]
+    donor_paths = [
+        os.path.join(args.data_path, f)
+        for f in os.listdir(args.data_path)
+        if f.endswith("_aligned.npz") and os.path.splitext(f.replace("_aligned", ""))[0] in label_map
+    ]
 
-    if len(donor_paths) == 0:
-        raise ValueError("No labeled donor files found in data_dir.")
+    if not donor_paths:
+        raise ValueError("No labeled aligned donor files found.")
 
-    donor_ids = [os.path.splitext(os.path.basename(p))[0] for p in donor_paths]
+    donor_ids = [os.path.splitext(os.path.basename(f).replace("_aligned", ""))[0] for f in donor_paths]
     donor_labels = [label_map[did] for did in donor_ids]
 
-    train_donors, test_donors = train_test_split(
-        donor_paths,
-        test_size=0.2,
-        stratify=donor_labels,
-        random_state=RANDOM_SEED
+    train_paths, test_paths = train_test_split(
+        donor_paths, test_size=0.2, stratify=donor_labels, random_state=RANDOM_SEED
     )
 
-    train_ds = CSRGeneExpressionDataset(train_donors, label_map)
-    test_ds = CSRGeneExpressionDataset(test_donors, label_map)
+    train_ds = GeneExpressionDataset(train_paths, label_map)
+    test_ds = GeneExpressionDataset(test_paths, label_map)
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=os.cpu_count())
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, num_workers=os.cpu_count())
 
-    global model, model_config
+    global model
     model = FineTuneClassifier(PRETRAINED_CKPT, unfreeze_last_n=UNFREEZE_LAST_N).to(device)
-    model_config = model.model_config
     optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=LEARNING_RATE)
     criterion = nn.BCEWithLogitsLoss()
 
     train_model(model, train_loader, test_loader, optimizer, criterion, device, EPOCHS)
 
-    # Save final versions
-    final_ckpt = os.path.join(SAVE_DIR, "finetuned_final.ckpt")
-    torch.save({'model': model.state_dict(), 'config': model_config}, final_ckpt)
-    print(f"[INFO] Final model saved: {final_ckpt}")
+    torch.save(model.state_dict(), os.path.join(SAVE_DIR, "finetuned_classifier.ckpt"))
+    torch.save(model.encoder.state_dict(), os.path.join(SAVE_DIR, "finetuned_encoder.ckpt"))
+    print("[INFO] Final model saved.")
 
-# -------------------------
-# Run
-# -------------------------
 if __name__ == '__main__':
     main()
