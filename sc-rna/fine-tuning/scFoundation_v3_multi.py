@@ -28,7 +28,7 @@ SAVE_DIR           = "./models/finetuned_c02x"
 UNFREEZE_LAST_N    = 2
 EPOCHS             = 5
 BATCH_SIZE         = 10  # per GPU
-LEARNING_RATE      = 1e-2
+LEARNING_RATE      = 1e-3
 RANDOM_SEED        = 42
 
 # Global model reference for cleanup

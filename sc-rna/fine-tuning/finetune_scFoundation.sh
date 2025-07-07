@@ -25,4 +25,4 @@ python3 scFoundation_v2_wb.py --data_path "../../MSSM"
 tar -cvf finetuned_c02x.tar models/finetuned_c02x
 
 # Step 8: Move tarball to top-level directory for HTCondor transfer
-mv finetuned_c02x.tar ../../..
+cp finetuned_c02x.tar ../../..

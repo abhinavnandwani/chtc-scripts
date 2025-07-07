@@ -1,78 +1,72 @@
 import os
+import sys
 import pandas as pd
 import scanpy as sc
 import anndata as ad
-import matplotlib.pyplot as plt
 from tqdm import tqdm
-
-# === RAPIDS Setup ===
-import rapids_singlecell as rsc
-import rmm
-import cupy as cp
-from rmm.allocators.cupy import rmm_cupy_allocator
-
-# Initialize GPU memory
-rmm.reinitialize(pool_allocator=True)
-cp.cuda.set_allocator(rmm_cupy_allocator)
+import numpy as np
+import multiprocessing
+import matplotlib.pyplot as plt
 
 # === Parameters ===
 meta_path = "MSSM_meta_obs.csv"
-use_rep_x = True  # Set to False to use PCA
 output_dir = "./"
+embedding_key = "X"  # use_rep key
+n_jobs = multiprocessing.cpu_count()  # Use all CPU cores
 
 method_paths = {
-    #"scGPT": "scGPT-main/results/zero-shot/extracted_cell_embeddings_full_body/",
-    "scMulan": "scMulan-main/results/zero-shot/extracted_cell_embeddings/"
-    # "UCE": "UCE_venv/UCE-main/results/cell_embeddings/extracted_cell_embeddings/",
+    # "scGPT": "scGPT-main/results/zero-shot/extracted_cell_embeddings_full_body/",
+    # "scMulan": "scMulan-main/results/zero-shot/extracted_cell_embeddings/",
+    "UCE": "UCE_venv/UCE-main/results/cell_embeddings/extracted_cell_embeddings/"
     # "scFoundation": "scFoundation/extracted_cell_embeddings/",
     # "Geneformer": "Geneformer_30M/extracted_cell_embeddings/"
 }
 
-# === Load Metadata ===
+# === Load metadata ===
 meta = pd.read_csv(meta_path)
 meta.index = meta.index.astype(str)
-donors = meta["SubID"].unique()
 
-# === Iterate Over Methods ===
-for method, path in method_paths.items():
-    print(f"\n🚀 Processing {method}...")
+# === Subsample first 20 donors ===
+donors = meta["SubID"].unique()[:20]
+meta = meta[meta["SubID"].isin(donors)]
 
-    cells = pd.DataFrame()
-    for donor in tqdm(donors, desc=f"📦 Loading {method}"):
+# === Process each method ===
+for method, path in tqdm(method_paths.items(), desc="Processing methods", file=sys.stdout):
+    tqdm.write(f"Processing UMAP for method: {method}", file=sys.stdout)
+
+    # === Load donor-wise embeddings ===
+    cell_list = []
+    for donor in tqdm(donors, desc=f"Loading donor files for {method}", file=sys.stdout):
         donor_file = os.path.join(path, f"{donor}.csv")
         if os.path.exists(donor_file):
             df = pd.read_csv(donor_file, index_col=0)
-            cells = pd.concat([cells, df])
+            cell_list.append(df)
         else:
-            print(f"⚠️ Warning: {donor_file} not found.")
+            tqdm.write(f"Missing file: {donor_file}", file=sys.stdout)
 
-    # === Sanity Check ===
+    if not cell_list:
+        raise RuntimeError(f"No donor files found for method: {method}")
+
+    # === Merge & Align ===
+    tqdm.write("Concatenating donor data", file=sys.stdout)
+    cells = pd.concat(cell_list, axis=0)
+
     if cells.shape[0] != meta.shape[0]:
-        raise ValueError(f"Mismatch in rows: cells={cells.shape[0]} vs meta={meta.shape[0]}")
+        raise ValueError(f"Mismatch in cell count: cells={cells.shape[0]} vs meta={meta.shape[0]}")
 
-    cells.columns = cells.columns.astype(str)
-    cells.index = meta.index.astype(str)
-    meta.index = meta.index.astype(str)
-
-    # === Create AnnData ===
+    cells.index = meta.index
     adata = ad.AnnData(X=cells, obs=meta, var=cells.columns.to_frame())
 
-    # === Move to GPU (in place) ===
-    rsc.get.anndata_to_GPU(adata)          # ← no reassignment
+    # === Compute neighbors ===
+    tqdm.write("Computing nearest neighbors", file=sys.stdout)
+    sc.pp.neighbors(adata, use_rep=embedding_key)
 
-    # === RAPIDS neighbors + UMAP ===
-    if use_rep_x:
-        rsc.pp.neighbors(adata, use_rep='X')
-    else:
-        rsc.pp.pca(adata, n_comps=100, use_highly_variable=False)
-        rsc.pp.neighbors(adata)
+    # === Run UMAP ===
+    tqdm.write(f"Running UMAP using {n_jobs} threads", file=sys.stdout)
+    sc.tl.umap(adata, min_dist=0.3, n_components=2, n_jobs=n_jobs)
 
-    rsc.tl.umap(adata, min_dist=0.3)
-
-    # === Back to CPU for visualization (in place) ===
-    rsc.get.anndata_to_CPU(adata)          # ← no reassignment
-
-    # === Plot and Save ===
+    # === Plot & Save ===
+    tqdm.write("Generating UMAP plot", file=sys.stdout)
     sc.pl.umap(
         adata,
         color=["class", "subclass"],
@@ -81,10 +75,15 @@ for method, path in method_paths.items():
         size=0.8,
         title=[f"{method}: class", f"{method}: subclass"]
     )
-    plt.savefig(os.path.join(output_dir, f"{method}.png"), dpi=300, bbox_inches="tight")
+    out_path = os.path.join(output_dir, f"{method}_umap_cpu.png")
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
     plt.close()
+    tqdm.write(f"UMAP plot saved to: {out_path}", file=sys.stdout)
+
+    # === Optional: Save AnnData object ===
+    adata_path = os.path.join(output_dir, f"{method}_umap.h5ad")
+    adata.write(adata_path)
+    tqdm.write(f"AnnData object saved to: {adata_path}", file=sys.stdout)
 
     # === Cleanup ===
-    del cells
-    del adata
-    cp.get_default_memory_pool().free_all_blocks()
+    del adata, cells, cell_list
